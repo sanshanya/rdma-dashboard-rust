@@ -4,6 +4,10 @@ mod handler;
 mod tui;
 mod ui;
 
+// !!! 新增: 注册硬核监控所需的模块 !!!
+pub mod monitor;
+pub mod fast_io;
+
 use crate::app::App;
 use anyhow::Result;
 use clap::Parser;
@@ -22,11 +26,13 @@ struct Mode {
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "A TUI dashboard for monitoring RDMA/InfiniBand ports.", long_about = None)]
-struct Args {
+pub struct Args {
     #[command(flatten)]
     mode: Mode,
 
-    /// Enable per-priority queue monitoring via ethtool (may need sudo).
+    /// Enable per-priority queue monitoring.
+    /// Note: In the current millisecond-precision mode, this flag might be ignored
+    /// to ensure system performance, as calling ethtool is too slow.
     #[arg(short = 'q', long, default_value_t = false)]
     monitor_queues: bool,
 }
@@ -36,13 +42,14 @@ async fn main() -> Result<()> {
     // 1. 解析参数
     let args = Args::parse();
 
-    // 2. 初始化终端 (RAII)
+    // 2. 初始化终端 (RAII模式，自动处理进入/退出 raw mode)
     let mut tui = tui::Tui::new()?;
 
     // 3. 创建并初始化 App
+    // 这里会启动后台的 1ms 硬核监控线程
     let mut app = App::try_new(args).await?;
 
-    // 4. 运行 App
+    // 4. 运行 App 主循环
     app.run(&mut tui).await?;
 
     Ok(())
