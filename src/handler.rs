@@ -9,14 +9,20 @@ pub fn handle_key_event(key_event: KeyEvent, app: &mut App) -> Result<()> {
             app.quit();
         }
         
-        // 切换视图模式 (表格 <-> 示波器)
+        // 切换视图
         KeyCode::Tab => {
             app.toggle_view_mode();
         }
 
-        // 你可以在这里保留之前的排序键，但需要在 App 中重新实现排序逻辑
-        // 目前为了专注于监控性能，暂时移除排序
-        // KeyCode::Char('n') => app.set_sort_key(SortKey::Name),
+        // --- 新增：滚动操作 ---
+        // 向上滚动
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.on_up();
+        }
+        // 向下滚动
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.on_down();
+        }
         
         _ => {}
     }

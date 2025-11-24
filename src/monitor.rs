@@ -4,6 +4,11 @@ use std::time::{Duration, Instant};
 use crate::fast_io::FastSysfsReader;
 use crate::data::PortType;
 
+// --- 配置常量 ---
+const HISTORY_CAPACITY: usize = 600; // 600点 * 10ms = 6秒历史
+const COMMIT_MS: u64 = 10;           // 10ms 聚合一次 (视觉精度)
+const TIME_STEP: f64 = 0.01;         // X轴每步 0.01s
+
 pub struct PortHistory {
     pub name: String,
     pub port_type: PortType,
@@ -16,13 +21,13 @@ impl PortHistory {
         Self {
             name,
             port_type,
-            rx_data: std::collections::VecDeque::with_capacity(200),
-            tx_data: std::collections::VecDeque::with_capacity(200),
+            rx_data: std::collections::VecDeque::with_capacity(HISTORY_CAPACITY),
+            tx_data: std::collections::VecDeque::with_capacity(HISTORY_CAPACITY),
         }
     }
     
     pub fn push_point(&mut self, time: f64, rx: f64, tx: f64) {
-        if self.rx_data.len() >= 200 {
+        if self.rx_data.len() >= HISTORY_CAPACITY {
             self.rx_data.pop_front();
             self.tx_data.pop_front();
         }
@@ -38,8 +43,7 @@ pub fn spawn_chart_monitor(
     history: Arc<RwLock<PortHistory>>
 ) {
     thread::spawn(move || {
-        // --- 1. 路径与倍率配置 ---
-        // 关键修复：RDMA 计数器 port_rcv_data 是 4 字节单位，Ethernet 是 1 字节
+        // 1. 路径与单位配置
         let (rx_path, tx_path, unit_multiplier) = match p_type {
             PortType::Rdma => {
                 let base = format!("/sys/class/infiniband/{}/ports/{}/counters", dev_part, port_part);
@@ -59,7 +63,7 @@ pub fn spawn_chart_monitor(
             }
         };
 
-        // --- 2. 初始化 ---
+        // 2. 初始化读取器
         let mut rx_reader = match FastSysfsReader::new(&rx_path) {
             Ok(f) => f, Err(_) => return,
         };
@@ -67,18 +71,19 @@ pub fn spawn_chart_monitor(
             Ok(f) => f, Err(_) => return,
         };
 
+        // 3. 状态变量
         let mut prev_rx: u64 = 0;
         let mut prev_tx: u64 = 0;
         let mut initialized = false; 
 
-        let loop_interval = Duration::from_micros(1000); 
-        let commit_interval = Duration::from_millis(50);
+        let loop_interval = Duration::from_micros(1000); // 采样依然是 1ms 硬核物理极限
+        let commit_interval = Duration::from_millis(COMMIT_MS); // 提交改为 10ms
         
         let mut next_tick = Instant::now();
         let mut last_commit_time = Instant::now();
         
-        // 使用真实启动时间作为 X 轴零点
-        let start_time = Instant::now();
+        // 逻辑时间轴 (0.00, 0.01, 0.02 ...)
+        let mut logical_time_axis = 0.0;
 
         // 局部峰值保持器
         let mut window_max_rx: f64 = 0.0;
@@ -92,13 +97,11 @@ pub fn spawn_chart_monitor(
             initialized = true;
         }
 
-        // --- 3. 1ms 硬核循环 ---
+        // 4. 循环
         loop {
-            // A. 时间锚点 (Drift Correction)
             next_tick += loop_interval;
             let now = Instant::now();
 
-            // B. 极速采集
             let curr_rx_res = rx_reader.read_u64();
             let curr_tx_res = tx_reader.read_u64();
             
@@ -108,10 +111,11 @@ pub fn spawn_chart_monitor(
                     
                     if delta_time > 0.000_001 {
                         if curr_rx >= prev_rx && curr_tx >= prev_tx {
-                            // 关键修复：应用单位倍率
+                            // 计算瞬时速度 (1ms slice)
                             let rx_speed = ((curr_rx - prev_rx) as f64 * unit_multiplier) / delta_time;
                             let tx_speed = ((curr_tx - prev_tx) as f64 * unit_multiplier) / delta_time;
 
+                            // 峰值保持 (Peak Hold)
                             if rx_speed > window_max_rx { window_max_rx = rx_speed; }
                             if tx_speed > window_max_tx { window_max_tx = tx_speed; }
                         }
@@ -128,25 +132,21 @@ pub fn spawn_chart_monitor(
             }
             prev_sample_time = now;
 
-            // C. 非阻塞提交 (Non-blocking Commit)
-            // 只有当距离上次提交超过 50ms 时才尝试提交
+            // 5. 提交逻辑 (10ms 一次)
             if now.duration_since(last_commit_time) >= commit_interval {
-                // 关键修复：使用 try_write()
-                // 如果 UI 正在读数据，这里会失败，不会阻塞。
-                // 失败后果：本次不提交，window_max 继续保留并累加，下一次循环再试。
-                // 结果：峰值绝对不会丢，只会延迟几毫秒显示。
+                // 非阻塞提交：如果 UI 在读，这帧就先攒着，不丢峰值
                 if let Ok(mut h) = history.try_write() {
-                    let actual_time = now.duration_since(start_time).as_secs_f64();
-                    h.push_point(actual_time, window_max_rx, window_max_tx);
+                    h.push_point(logical_time_axis, window_max_rx, window_max_tx);
                     
-                    // 只有成功提交了，才重置峰值
+                    // 只有成功提交才重置
                     window_max_rx = 0.0;
                     window_max_tx = 0.0;
                     last_commit_time = now;
+                    logical_time_axis += TIME_STEP;
                 }
             }
 
-            // D. 精确休眠
+            // 6. 休眠
             let time_until_next = next_tick.saturating_duration_since(Instant::now());
             if !time_until_next.is_zero() {
                 thread::sleep(time_until_next);
